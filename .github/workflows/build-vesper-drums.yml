@@ -1,0 +1,405 @@
+name: Build VESPER
+
+# VESPER only. (VESPER DRUMS has its own repo, its own zip and its own build-vesper-drums.yml.)
+# Put VESPER_project.zip in the repo's main folder and this file in .github/workflows/.
+
+# Every upload builds the WINDOWS installer. The Mac installer only builds when you ask for it (it uses up GitHub's
+# free build minutes about 10 times faster): Actions > Build VESPER > Run workflow > tick "Also build the Mac installer".
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      mac:
+        description: "Also build the Mac installer"
+        type: boolean
+        default: false
+
+# a new upload stops a build that's still running for an older one (saves build minutes)
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine-test:
+    name: Chord engine self-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          # Look through every zip in the repo and use the NEWEST one that holds VESPER.
+          # (A VESPER DRUMS zip that ended up here by mistake is skipped.)
+          vnum() { echo "$1" | awk -F. '{ printf "%05d%05d%05d", $1, $2, $3 }'; }
+          BEST=""; BESTVER=""; FOUND=""; COUNT=0; N=0
+          while IFS= read -r z; do
+            N=$((N+1)); d="_try$N"; rm -rf "$d"; mkdir "$d"
+            if ! (cd "$d" && cmake -E tar xf "../$z"); then echo "Couldn't open $z"; continue; fi
+            m=$(find "$d" -maxdepth 4 -path '*/plugin/PluginProcessor.cpp' | head -n 1)
+            if [ -z "$m" ]; then echo "Skipping $z (that's not the VESPER project)"; continue; fi
+            root=$(dirname "$(dirname "$m")")
+            v=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' "$root/CMakeLists.txt" | head -n 1)
+            echo "Found VESPER ${v:-?} in $z"
+            COUNT=$((COUNT+1))
+            if [ -z "$BEST" ] || [ "$(vnum "$v")" \> "$(vnum "$BESTVER")" ]; then BEST="$root"; BESTVER="$v"; FOUND="$z"; fi
+          done < <(find . -path ./src -prune -o -path ./.git -prune -o -name '_try*' -prune -o -type f -iname '*.zip' -print | sort)
+          if [ -n "$BEST" ]; then
+            cp -R "$BEST"/. src/
+          elif [ -f plugin/PluginProcessor.cpp ]; then
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+            FOUND="the files in the repo"
+          fi
+          rm -rf _try*
+          if [ ! -f src/CMakeLists.txt ] || [ ! -f src/plugin/PluginProcessor.cpp ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to this repo (Add file > Upload files > Commit changes). The VESPER DRUMS zip goes in its own repo."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::warning::This repo has $COUNT VESPER zips. Building the newest one ($BESTVER, $FOUND). Delete the old ones so they don't get mixed up."
+          fi
+          VER=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' src/CMakeLists.txt | head -n 1)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "Building VESPER $VER from $FOUND"
+          echo "### Building VESPER $VER (from $FOUND)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and run the self-test
+        run: |
+          g++ -std=c++17 -O2 -o selftest src/tests/selftest.cpp src/core/*.cpp
+          ./selftest
+
+  windows:
+    name: Windows VST3 + installer
+    runs-on: windows-latest
+    needs: engine-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          # Look through every zip in the repo and use the NEWEST one that holds VESPER.
+          # (A VESPER DRUMS zip that ended up here by mistake is skipped.)
+          vnum() { echo "$1" | awk -F. '{ printf "%05d%05d%05d", $1, $2, $3 }'; }
+          BEST=""; BESTVER=""; FOUND=""; COUNT=0; N=0
+          while IFS= read -r z; do
+            N=$((N+1)); d="_try$N"; rm -rf "$d"; mkdir "$d"
+            if ! (cd "$d" && cmake -E tar xf "../$z"); then echo "Couldn't open $z"; continue; fi
+            m=$(find "$d" -maxdepth 4 -path '*/plugin/PluginProcessor.cpp' | head -n 1)
+            if [ -z "$m" ]; then echo "Skipping $z (that's not the VESPER project)"; continue; fi
+            root=$(dirname "$(dirname "$m")")
+            v=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' "$root/CMakeLists.txt" | head -n 1)
+            echo "Found VESPER ${v:-?} in $z"
+            COUNT=$((COUNT+1))
+            if [ -z "$BEST" ] || [ "$(vnum "$v")" \> "$(vnum "$BESTVER")" ]; then BEST="$root"; BESTVER="$v"; FOUND="$z"; fi
+          done < <(find . -path ./src -prune -o -path ./.git -prune -o -name '_try*' -prune -o -type f -iname '*.zip' -print | sort)
+          if [ -n "$BEST" ]; then
+            cp -R "$BEST"/. src/
+          elif [ -f plugin/PluginProcessor.cpp ]; then
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+            FOUND="the files in the repo"
+          fi
+          rm -rf _try*
+          if [ ! -f src/CMakeLists.txt ] || [ ! -f src/plugin/PluginProcessor.cpp ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to this repo (Add file > Upload files > Commit changes). The VESPER DRUMS zip goes in its own repo."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::warning::This repo has $COUNT VESPER zips. Building the newest one ($BESTVER, $FOUND). Delete the old ones so they don't get mixed up."
+          fi
+          VER=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' src/CMakeLists.txt | head -n 1)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "Building VESPER $VER from $FOUND"
+          echo "### Building VESPER $VER (from $FOUND)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S src -B build -G "Visual Studio 18 2026" -A x64 -DVESPER_BUILD_TOOLS=OFF
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Visual Studio 2026 not found, using 2022"
+            Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+            cmake -S src -B build -G "Visual Studio 17 2022" -A x64 -DVESPER_BUILD_TOOLS=OFF
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+
+      - name: Build VST3
+        run: cmake --build build --config Release --target VESPER_VST3 --parallel
+
+      # VESPER VOICE: the little app that hears "hook", "fill", "solo keys"... and tells VESPER. Built with the C#
+      # compiler that comes with Windows. If it ever fails, the plugin still builds and the PowerShell version ships.
+      - name: Build VESPER VOICE
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "src/voice/VesperVoice.cs")) { Write-Host "No voice app in this project"; exit 0 }
+          $csc = Get-ChildItem "$env:WINDIR\Microsoft.NET\Framework64\v4*\csc.exe" -ErrorAction SilentlyContinue | Select-Object -Last 1
+          $speech = Get-ChildItem -Recurse -ErrorAction SilentlyContinue "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework" -Filter System.Speech.dll | Sort-Object FullName | Select-Object -Last 1
+          if (-not $speech) { $speech = Get-ChildItem -Recurse -ErrorAction SilentlyContinue "$env:WINDIR\Microsoft.NET\assembly\GAC_MSIL\System.Speech" -Filter System.Speech.dll | Select-Object -First 1 }
+          if (-not $csc -or -not $speech) { Write-Host "::warning::No C# compiler / System.Speech here - the PowerShell version of VESPER VOICE is in the download"; exit 0 }
+          New-Item -ItemType Directory -Force -Path voiceout | Out-Null
+          & $csc.FullName /nologo /target:winexe /optimize+ "/out:voiceout\VESPER VOICE.exe" "/r:$($speech.FullName)" /r:System.Windows.Forms.dll /r:System.Drawing.dll "src\voice\VesperVoice.cs"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::warning::VESPER VOICE.exe didn't build - the PowerShell version is in the download"; exit 0 }
+          Get-ChildItem voiceout
+
+      - name: Collect (plugin + INSTALL.bat + read-me)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Recurse "build/VESPER_artefacts/Release/VST3/VESPER.vst3" "dist/VESPER.vst3"
+          Copy-Item "src/packaging/INSTALL.bat" "dist/INSTALL.bat"
+          Copy-Item "src/packaging/READ-ME-FIRST.txt" "dist/READ-ME-FIRST.txt"
+          if (-not (Test-Path "dist/VESPER.vst3")) { Write-Host "::error::VESPER.vst3 was not built"; exit 1 }
+          if (Test-Path "src/voice") {
+            New-Item -ItemType Directory -Force -Path "dist/VESPER VOICE" | Out-Null
+            Copy-Item -LiteralPath "src/voice/VESPER VOICE.ps1" -Destination "dist/VESPER VOICE/"
+            Copy-Item -LiteralPath "src/voice/VESPER VOICE (PowerShell).bat" -Destination "dist/VESPER VOICE/"
+            if (Test-Path -LiteralPath "voiceout/VESPER VOICE.exe") { Copy-Item -LiteralPath "voiceout/VESPER VOICE.exe" -Destination "dist/VESPER VOICE/" }
+          }
+
+      - name: Make VESPER-Setup.exe
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y | Out-Null }
+          if (-not (Test-Path $iscc)) { Write-Host "Inno Setup not available - INSTALL.bat is in the download"; exit 0 }
+          & $iscc "/DSrcDir=$PWD\dist" "/DAppVer=$env:VER" "/O$PWD\dist" "src\packaging\VESPER.iss"
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - name: Upload (this is the download on the run page)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VESPER-${{ env.VER }}-windows
+          path: dist/
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------------------------
+  # Mac: one installer for BOTH kinds of Mac (Intel and Apple Silicon M1/M2/M3/M4), installed into the
+  # system plugin folders by VESPER-Installer.pkg. It then installs itself on a real Intel Mac AND a
+  # real Apple Silicon Mac in the cloud and checks it loads.
+  # ----------------------------------------------------------------------------------------------
+  mac:
+    name: Mac installer (Intel + Apple Silicon)
+    runs-on: macos-15-intel
+    if: github.event_name == 'workflow_dispatch' && inputs.mac
+    needs: engine-test
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project
+        shell: bash
+        run: |
+          set -e
+          mkdir -p src
+          # Look through every zip in the repo and use the NEWEST one that holds VESPER.
+          # (A VESPER DRUMS zip that ended up here by mistake is skipped.)
+          vnum() { echo "$1" | awk -F. '{ printf "%05d%05d%05d", $1, $2, $3 }'; }
+          BEST=""; BESTVER=""; FOUND=""; COUNT=0; N=0
+          while IFS= read -r z; do
+            N=$((N+1)); d="_try$N"; rm -rf "$d"; mkdir "$d"
+            if ! (cd "$d" && cmake -E tar xf "../$z"); then echo "Couldn't open $z"; continue; fi
+            m=$(find "$d" -maxdepth 4 -path '*/plugin/PluginProcessor.cpp' | head -n 1)
+            if [ -z "$m" ]; then echo "Skipping $z (that's not the VESPER project)"; continue; fi
+            root=$(dirname "$(dirname "$m")")
+            v=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' "$root/CMakeLists.txt" | head -n 1)
+            echo "Found VESPER ${v:-?} in $z"
+            COUNT=$((COUNT+1))
+            if [ -z "$BEST" ] || [ "$(vnum "$v")" \> "$(vnum "$BESTVER")" ]; then BEST="$root"; BESTVER="$v"; FOUND="$z"; fi
+          done < <(find . -path ./src -prune -o -path ./.git -prune -o -name '_try*' -prune -o -type f -iname '*.zip' -print | sort)
+          if [ -n "$BEST" ]; then
+            cp -R "$BEST"/. src/
+          elif [ -f plugin/PluginProcessor.cpp ]; then
+            echo "No zip found - using the files in the repo"
+            for f in CMakeLists.txt core plugin tests packaging; do if [ -e "$f" ]; then cp -R "$f" src/; fi; done
+            FOUND="the files in the repo"
+          fi
+          rm -rf _try*
+          if [ ! -f src/CMakeLists.txt ] || [ ! -f src/plugin/PluginProcessor.cpp ]; then
+            echo "::error::Couldn't find the VESPER project. Upload VESPER_project.zip to this repo (Add file > Upload files > Commit changes). The VESPER DRUMS zip goes in its own repo."
+            exit 1
+          fi
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::warning::This repo has $COUNT VESPER zips. Building the newest one ($BESTVER, $FOUND). Delete the old ones so they don't get mixed up."
+          fi
+          VER=$(sed -n 's/^project(VESPER VERSION \([0-9.]*\).*/\1/p' src/CMakeLists.txt | head -n 1)
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "Building VESPER $VER from $FOUND"
+          echo "### Building VESPER $VER (from $FOUND)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build (Intel + Apple Silicon in one plugin)
+        run: |
+          mkdir -p out
+          set -o pipefail
+          cmake -S src -B build -DCMAKE_BUILD_TYPE=Release -DVESPER_BUILD_TOOLS=OFF \
+                "-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.13 2>&1 | tee out/build-log.txt
+          cmake --build build --config Release --parallel 4 --target VESPER_VST3 VESPER_AU 2>&1 | tail -200 | tee -a out/build-log.txt
+
+      - name: Sign (ad-hoc)
+        run: |
+          mkdir -p stage
+          for name in VESPER.vst3 VESPER.component; do
+            found=$(find build -maxdepth 6 -name "$name" -type d | head -1)
+            if [ -z "$found" ]; then echo "::error::$name was not built"; exit 1; fi
+            codesign --force --deep --sign - "$found"
+            cp -R "$found" stage/
+          done
+
+      - name: Make VESPER-Installer.pkg
+        run: |
+          mkdir -p out
+          exec > >(tee -a out/pkg-log.txt) 2>&1   # everything below also lands in pkg-log.txt on the Releases page
+          set -ex
+
+          # one package per plugin format, each installed straight into the Mac's system plugin folder
+          mkdir -p rootV rootA scriptsV scriptsA
+          cp -R stage/VESPER.vst3 rootV/
+          cp -R stage/VESPER.component rootA/
+
+          # never "relocate" onto an older copy somewhere else on the Mac: always install exactly here
+          for f in VESPER.vst3:v.plist VESPER.component:a.plist; do
+            bundle=${f%%:*}; out=${f##*:}
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+              '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+              '<plist version="1.0"><array><dict>' \
+              '<key>BundleHasStrictIdentifier</key><false/>' \
+              '<key>BundleIsRelocatable</key><false/>' \
+              '<key>BundleIsVersionChecked</key><false/>' \
+              '<key>BundleOverwriteAction</key><string>upgrade</string>' \
+              "<key>RootRelativeBundlePath</key><string>$bundle</string>" \
+              '</dict></array></plist>' > "$out"
+            plutil -lint "$out"
+          done
+
+          # before installing: remove older copies, including ones the old INSTALL-Mac.command put in the user's own Library
+          printf '%s\n' '#!/bin/bash' \
+            'rm -rf "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "/Library/Audio/Plug-Ins/Components/VESPER.component"' \
+            'U=$(stat -f%Su /dev/console 2>/dev/null)' \
+            'if [ -n "$U" ] && [ "$U" != "root" ]; then' \
+            '  H=$(dscl . -read "/Users/$U" NFSHomeDirectory 2>/dev/null | awk "{print \$2}")' \
+            '  if [ -n "$H" ]; then rm -rf "$H/Library/Audio/Plug-Ins/VST3/VESPER.vst3" "$H/Library/Audio/Plug-Ins/Components/VESPER.component"; fi' \
+            'fi' \
+            'exit 0' > scriptsV/preinstall
+          # after installing: clear the "downloaded from the internet" mark so FL may load it; refresh the AU list
+          printf '%s\n' '#!/bin/bash' \
+            'xattr -cr "/Library/Audio/Plug-Ins/VST3/VESPER.vst3" 2>/dev/null' \
+            'exit 0' > scriptsV/postinstall
+          printf '%s\n' '#!/bin/bash' \
+            'xattr -cr "/Library/Audio/Plug-Ins/Components/VESPER.component" 2>/dev/null' \
+            'killall -9 AudioComponentRegistrar 2>/dev/null' \
+            'exit 0' > scriptsA/postinstall
+          chmod +x scriptsV/* scriptsA/*
+          bash -n scriptsV/preinstall && bash -n scriptsV/postinstall && bash -n scriptsA/postinstall
+
+          pkgbuild --root rootV --component-plist v.plist --scripts scriptsV --identifier com.gwapmane.vesper.vst3 \
+                   --version "$VER" --install-location /Library/Audio/Plug-Ins/VST3 VESPER-vst3.pkg
+          pkgbuild --root rootA --component-plist a.plist --scripts scriptsA --identifier com.gwapmane.vesper.au \
+                   --version "$VER" --install-location /Library/Audio/Plug-Ins/Components VESPER-au.pkg
+          productbuild --synthesize --package VESPER-vst3.pkg --package VESPER-au.pkg distribution.xml
+          productbuild --distribution distribution.xml --package-path . out/VESPER-Installer.pkg
+          pkgutil --payload-files out/VESPER-Installer.pkg | head -20 || true
+
+          printf '%s\n' "VESPER $VER for Mac (Intel and Apple Silicon)" '========================================' \
+            '1. Double-click VESPER-Installer.pkg.' \
+            '   If the Mac says it is from an unidentified developer: right-click it > Open > Open.' \
+            '   (Or: System Settings > Privacy & Security > scroll down > Open Anyway.)' \
+            '2. Click Continue / Install and type your Mac password.' \
+            '   It replaces any older VESPER, including copies from the old INSTALL-Mac.command.' \
+            '3. Quit FL Studio completely and open it again.' \
+            '4. FL Studio: Options > Manage plugins > Find installed plugins (leave "Verify plugins" ticked).' \
+            '   VESPER is an instrument: add it from the Channel rack (+). You may see it twice (VST3 and AU). Either one works.' \
+            '   Ableton Live: Settings > Plug-Ins > turn on "Use Audio Units v2" and "Use VST3 Plug-In System Folders",' \
+            '   click Rescan. VESPER is under Plug-Ins (VST3 or Audio Units).' \
+            '' \
+            'VESPER DRUMS is a separate download (its own repo and its own installer).' \
+            '' \
+            'ABLETON: PLAY YOUR OTHER INSTRUMENTS WITH VESPER' \
+            '1. Put VESPER on a MIDI track and arm it (or set Monitor to In).' \
+            '2. On a second MIDI track with your synth: MIDI From = the VESPER track, and in the box under it pick VESPER' \
+            '   (not Pre FX / Post FX). Set that track Monitor = In.' \
+            '3. Turn KEYS SOUND off in VESPER so you only hear your synth.' \
+            > out/READ-ME-MAC.txt
+          ls -la out
+
+      - name: Self-test - install it on this Mac and check it loads
+        continue-on-error: true
+        run: |
+          R=out/mac-test-report.txt
+          {
+            echo "== cloud Mac =="; sw_vers; uname -m
+            echo; echo "== installing VESPER-Installer.pkg ($VER) =="
+            sudo installer -pkg out/VESPER-Installer.pkg -target / 2>&1
+            echo; echo "== installed files =="
+            ls -la /Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS /Library/Audio/Plug-Ins/Components/VESPER.component/Contents/MacOS 2>&1
+            exe=/Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS/VESPER
+            echo; echo "-- architectures:"; lipo -info "$exe" 2>&1
+            echo "-- minimum macOS:"; otool -l "$exe" | grep -A4 -E "LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX" | head -6
+            echo "-- signature check:"; codesign --verify --deep --strict --verbose=2 /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | head -4
+            echo; echo "== Audio Unit check (auval) =="
+            killall -9 AudioComponentRegistrar 2>/dev/null || true; sleep 3
+            auval -a 2>&1 | grep -i -E "vesper|Vspr" || echo "VESPER not listed by auval"
+            auval -v aumu Vchd Vspr 2>&1 | tail -25
+            echo; echo "== VST3 check (pluginval) =="
+            curl -sL -o pv.zip https://github.com/Tracktion/pluginval/releases/latest/download/pluginval_macOS.zip && unzip -q -o pv.zip
+            ./pluginval.app/Contents/MacOS/pluginval --strictness-level 5 --skip-gui-tests --validate-in-process \
+              /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | tail -30
+          } > "$R" 2>&1
+          cat "$R"
+
+      - name: Upload (also on the run page)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VESPER-${{ env.VER }}-mac
+          path: out/
+          if-no-files-found: ignore
+
+      # Releases page: VESPER-Installer.pkg as a direct download, plus the reports
+      - name: Publish to Releases
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="vesper-mac"
+          echo "${{ job.status }}" > out/status.txt
+          gh release delete "$TAG" -y --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" out/* --target "$GITHUB_SHA" --title "VESPER $VER for Mac (Intel + Apple Silicon)" \
+            --notes "Download VESPER-Installer.pkg, right-click > Open, then Install. Rescan plugins in FL Studio or Ableton. Works on Intel and Apple Silicon Macs." --prerelease
+
+  # installs the same VESPER-Installer.pkg on a real Apple Silicon Mac and checks it loads there too
+  mac-apple-silicon-test:
+    name: Test on Apple Silicon Mac
+    runs-on: macos-15
+    needs: mac
+    permissions:
+      contents: write
+    steps:
+      - name: Install and check
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R=apple-silicon-test-report.txt
+          {
+            echo "== cloud Mac =="; sw_vers; uname -m
+            gh release download vesper-mac -R "$GITHUB_REPOSITORY" -p VESPER-Installer.pkg -D . --clobber
+            echo; echo "== installing VESPER-Installer.pkg =="
+            sudo installer -pkg VESPER-Installer.pkg -target / 2>&1
+            exe=/Library/Audio/Plug-Ins/VST3/VESPER.vst3/Contents/MacOS/VESPER
+            echo; echo "-- architectures:"; lipo -info "$exe" 2>&1
+            echo "-- signature check:"; codesign --verify --deep --strict --verbose=2 /Library/Audio/Plug-Ins/VST3/VESPER.vst3 2>&1 | head -4
+            echo; echo "== Audio Unit check (auval) =="
+            killall -9 AudioComponentRegistrar 2>/dev/null || true; sleep 3
+            auval -a 2>&1 | grep -i -E "vesper|Vspr" || echo "VESPER not listed by auval"
+            auval -v aumu Vchd Vspr 2>&1 | tail -25
+          } > "$R" 2>&1
+          cat "$R"
+          gh release upload vesper-mac "$R" -R "$GITHUB_REPOSITORY" --clobber
